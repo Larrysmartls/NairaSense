@@ -2,13 +2,22 @@ import { GoogleGenAI } from "@google/genai";
 import { supabase } from "./supabase";
 import { ExchangeData, Source, CurrencyCode } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 const CACHE_DURATION_MS = 30 * 60 * 1000; // 30 minutes
+
+// Emergency static fallbacks to prevent app crash on cold start + API 429
+const EMERGENCY_RATES: Record<string, number> = {
+    'USD-NGN': 1580.00,
+    'GBP-NGN': 2050.00,
+    'EUR-NGN': 1720.00,
+    'CAD-NGN': 1150.00
+};
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Internal: Direct AI Call
 const fetchFromAI = async (from: CurrencyCode, to: CurrencyCode): Promise<ExchangeData> => {
+    // Initialize AI client lazily
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const model = 'gemini-3-flash-preview';
     const isNairaSearch = from === 'NGN' || to === 'NGN';
     
@@ -83,9 +92,9 @@ const fetchFromAI = async (from: CurrencyCode, to: CurrencyCode): Promise<Exchan
       }
     }
     
-    // Safety Fallback for USD/NGN
-    if (detectedRate === 0 && from === 'USD' && to === 'NGN') {
-        detectedRate = 1600; 
+    // Validation: If AI returns 0, throw error to trigger fallback
+    if (detectedRate === 0) {
+        throw new Error("AI returned 0 rate");
     }
 
     return {
@@ -98,11 +107,10 @@ const fetchFromAI = async (from: CurrencyCode, to: CurrencyCode): Promise<Exchan
 };
 
 // Internal: Retry Logic for API Quotas
-const attemptAIFetchWithRetry = async (from: CurrencyCode, to: CurrencyCode, retries = 2): Promise<ExchangeData> => {
+const attemptAIFetchWithRetry = async (from: CurrencyCode, to: CurrencyCode, retries = 1): Promise<ExchangeData> => {
     try {
         return await fetchFromAI(from, to);
     } catch (err: any) {
-        // Check for 429 in various formats (code, status, or message)
         const isQuota = err?.status === 429 || err?.code === 429 || (err?.message && (err.message.includes('429') || err.message.includes('quota')));
         
         if (retries > 0 && isQuota) {
@@ -146,6 +154,7 @@ export const fetchRealTimeRate = async (from: CurrencyCode, to: CurrencyCode): P
     }
 
     const pairId = `${searchFrom}-${searchTo}`;
+    let resultToReturn: ExchangeData | null = null;
     let staleRecord: any = null;
 
     // 2. CHECK SUPABASE (Fetch regardless of freshness to use as fallback)
@@ -161,55 +170,69 @@ export const fetchRealTimeRate = async (from: CurrencyCode, to: CurrencyCode): P
         const updatedAt = new Date(data.updated_at).getTime();
         const now = new Date().getTime();
         
-        // If fresh, return immediately
+        // If fresh, use immediately
         if (now - updatedAt < CACHE_DURATION_MS) {
           console.log(`Using fresh cached rate for ${pairId}`);
-          const result = mapDbToExchangeData(data);
-          return shouldInvert ? invertExchangeData(result) : result;
+          resultToReturn = mapDbToExchangeData(data);
         }
       }
     } catch (dbError) {
       console.warn("Supabase cache check failed", dbError);
     }
 
-    // 3. FETCH FROM AI (with Retry for 429)
-    console.log(`Cache stale or missing for ${pairId}. Fetching from AI...`);
-    
-    try {
-        const aiResult = await attemptAIFetchWithRetry(searchFrom, searchTo);
+    // 3. FETCH FROM AI (If no fresh cache)
+    if (!resultToReturn) {
+        console.log(`Cache stale or missing for ${pairId}. Fetching from AI...`);
+        try {
+            const aiResult = await attemptAIFetchWithRetry(searchFrom, searchTo);
 
-        // 4. SAVE TO SUPABASE
-        if (aiResult.rate > 0) {
-            supabase.from('currency_rates').upsert({
-                pair: pairId,
-                rate: aiResult.rate,
-                parallel_rate: aiResult.parallelRate || null,
-                summary: aiResult.summary,
-                sources: aiResult.sources,
-                updated_at: new Date().toISOString()
-            }).then(({ error }) => {
-                if (error) console.warn("Background cache update failed", error);
-            });
+            // 4. SAVE TO SUPABASE
+            if (aiResult.rate > 0) {
+                supabase.from('currency_rates').upsert({
+                    pair: pairId,
+                    rate: aiResult.rate,
+                    parallel_rate: aiResult.parallelRate || null,
+                    summary: aiResult.summary,
+                    sources: aiResult.sources,
+                    updated_at: new Date().toISOString()
+                }).then(({ error }) => {
+                    if (error) console.warn("Background cache update failed", error);
+                });
+            }
+            resultToReturn = aiResult;
+
+        } catch (aiError: any) {
+            console.error("AI Fetch failed:", aiError);
+
+            // 5. FALLBACK 1: STALE DATABASE DATA
+            if (staleRecord) {
+                console.warn(`Falling back to stale data for ${pairId}`);
+                resultToReturn = mapDbToExchangeData(staleRecord);
+                resultToReturn.lastUpdated = `${resultToReturn.lastUpdated} (Cached)`;
+            } 
+            // 6. FALLBACK 2: EMERGENCY STATIC DATA (Cold start + API Error)
+            else if (EMERGENCY_RATES[pairId]) {
+                console.warn(`Using emergency static fallback for ${pairId}`);
+                resultToReturn = {
+                    rate: EMERGENCY_RATES[pairId],
+                    lastUpdated: "Offline Estimate",
+                    summary: "High demand detected. Showing estimated market rates while we reconnect to live data.",
+                    sources: []
+                };
+            }
+            else {
+                // Only throw if absolutely no data is available
+                throw aiError;
+            }
         }
-
-        // 5. RETURN FRESH RESULT
-        return shouldInvert ? invertExchangeData(aiResult) : aiResult;
-
-    } catch (aiError: any) {
-        console.error("AI Fetch failed:", aiError);
-
-        // 6. FALLBACK TO STALE DATA
-        if (staleRecord) {
-            console.warn(`Falling back to stale data for ${pairId} due to error`);
-            const result = mapDbToExchangeData(staleRecord);
-            // Mark as cached/offline visually
-            result.lastUpdated = `${result.lastUpdated} (Cached)`;
-            return shouldInvert ? invertExchangeData(result) : result;
-        }
-
-        // If no stale data and AI fails, throw the error
-        throw aiError;
     }
+
+    // 7. RETURN & INVERT IF NEEDED
+    if (resultToReturn) {
+        return shouldInvert ? invertExchangeData(resultToReturn) : resultToReturn;
+    }
+    
+    throw new Error("Unexpected state: No rate data available");
 
   } catch (error) {
     console.error("Failed to fetch rates:", error);
